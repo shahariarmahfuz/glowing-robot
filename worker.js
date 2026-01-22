@@ -15,14 +15,13 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/webhook") {
-      return new Response("Webhook ready ✅ (Telegram uses POST)", { status: 200 });
+      return new Response("Webhook ready ✅", { status: 200 });
     }
 
     if (request.method === "POST" && url.pathname === "/webhook") {
       try {
         const update = await request.json();
         const msg = update.message || update.edited_message;
-
         if (!msg) return new Response("ok", { status: 200 });
 
         const chatId = msg.chat.id;
@@ -30,19 +29,15 @@ export default {
 
         // /start <token>
         if (text.startsWith("/start")) {
-          const parts = text.split(" ");
-          const payload = parts[1];
+          const payload = text.split(" ")[1];
 
           if (!payload) {
             await tgSendMessage(chatId, "✅ Ready! ফাইল পাঠাও, আমি লিংক বানিয়ে দেব।");
             return new Response("ok", { status: 200 });
           }
 
-          // token -> channel message lookup
           const row = await env.DB
-            .prepare(
-              "SELECT token, channel_chat_id, channel_message_id FROM files WHERE token = ?"
-            )
+            .prepare("SELECT channel_chat_id, channel_message_id FROM files WHERE token = ?")
             .bind(payload)
             .first();
 
@@ -51,32 +46,30 @@ export default {
             return new Response("ok", { status: 200 });
           }
 
-          await env.DB
-            .prepare("UPDATE files SET hits = hits + 1 WHERE token = ?")
+          await env.DB.prepare("UPDATE files SET hits = hits + 1 WHERE token = ?")
             .bind(payload)
             .run();
 
-          // Copy message from channel to user
+          // Copy file from channel to user
           const copied = await tgCopyMessage(chatId, row.channel_chat_id, row.channel_message_id);
-
           const userMessageId = copied?.result?.message_id;
+
           if (!userMessageId) {
-            // If copy failed, show reason in logs
             console.log("copyMessage response:", JSON.stringify(copied));
-            await tgSendMessage(chatId, "⚠️ ফাইল পাঠাতে পারলাম না। পরে আবার চেষ্টা করো।");
+            await tgSendMessage(chatId, "⚠️ ফাইল পাঠানো যায়নি। পরে আবার চেষ্টা করো।");
             return new Response("ok", { status: 200 });
           }
 
-          // Schedule deletion job (Cron will execute)
-          await scheduleDeleteJob(env, String(chatId), Number(userMessageId), DELETE_AFTER_SECONDS);
+          // ✅ Perfect-timing delete via Durable Object alarm
+          await scheduleDelete(env, String(chatId), Number(userMessageId), DELETE_AFTER_SECONDS);
 
           return new Response("ok", { status: 200 });
         }
 
-        // For any other user message => forward to channel => save token => send link
+        // Any other message => forward to channel => save token => send link
         const fwd = await tgForwardMessage(TARGET_CHAT_ID, chatId, msg.message_id);
-
         const channelMessageId = fwd?.result?.message_id;
+
         if (!channelMessageId) {
           console.log("forwardMessage response:", JSON.stringify(fwd));
           await tgSendMessage(chatId, "⚠️ ফরওয়ার্ড ঠিকমতো হয়নি। আবার চেষ্টা করো।");
@@ -103,13 +96,59 @@ export default {
 
     return new Response("Not found", { status: 404 });
   },
-
-  // Cron runs every minute
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(processDeleteJobs(env));
-  },
 };
 
+// ---------------- Durable Object (Perfect Timer) ----------------
+export class DeleteTimer {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname !== "/schedule") return new Response("Not found", { status: 404 });
+
+    const { chatId, messageId, delaySeconds } = await request.json();
+
+    // store job data
+    await this.state.storage.put("job", { chatId, messageId });
+
+    // set alarm precisely
+    const when = Date.now() + Math.max(1, delaySeconds) * 1000;
+    await this.state.storage.setAlarm(when);
+
+    return new Response("scheduled", { status: 200 });
+  }
+
+  async alarm() {
+    const job = await this.state.storage.get("job");
+    if (!job) return;
+
+    // delete message
+    await tgDeleteMessage(job.chatId, job.messageId);
+
+    // send notice
+    await tgSendMessage(job.chatId, DELETE_NOTICE_TEXT);
+
+    // cleanup
+    await this.state.storage.deleteAll();
+  }
+}
+
+async function scheduleDelete(env, chatId, messageId, delaySeconds) {
+  // unique object per (chatId,messageId)
+  const id = env.DEL.idFromName(`${chatId}:${messageId}`);
+  const stub = env.DEL.get(id);
+
+  await stub.fetch("https://do/schedule", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chatId, messageId, delaySeconds }),
+  });
+}
+
+// ---------------- Helpers ----------------
 function generateToken() {
   const bytes = new Uint8Array(12);
   crypto.getRandomValues(bytes);
@@ -123,48 +162,6 @@ function base64Url(bytes) {
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-// --- D1 delete jobs ---
-async function scheduleDeleteJob(env, chatId, messageId, seconds) {
-  // D1 uses SQLite datetime
-  await env.DB.prepare(
-    "INSERT INTO delete_jobs (chat_id, message_id, due_at) VALUES (?, ?, datetime('now', ?))"
-  )
-    .bind(String(chatId), Number(messageId), `+${seconds} seconds`)
-    .run();
-}
-
-async function processDeleteJobs(env) {
-  // Take a batch to avoid long cron runtime
-  const { results } = await env.DB.prepare(
-    "SELECT id, chat_id, message_id FROM delete_jobs WHERE due_at <= datetime('now') ORDER BY due_at ASC LIMIT 50"
-  ).all();
-
-  if (!results || results.length === 0) return;
-
-  for (const job of results) {
-    try {
-      // Try deleting the file message
-      const del = await tgDeleteMessage(job.chat_id, job.message_id);
-
-      // Always send notice (even if delete fails, user will know)
-      // If you want: only send notice when delete ok, you can check del.ok
-      await tgSendMessage(job.chat_id, DELETE_NOTICE_TEXT);
-
-      // Remove job so we don't retry forever
-      await env.DB.prepare("DELETE FROM delete_jobs WHERE id = ?").bind(job.id).run();
-
-      if (del && del.ok !== true) {
-        console.log("deleteMessage not ok:", JSON.stringify(del));
-      }
-    } catch (e) {
-      console.log("process job error:", e?.stack || e?.message || String(e));
-      // Remove job to prevent infinite retry; or keep it for retry—your choice
-      await env.DB.prepare("DELETE FROM delete_jobs WHERE id = ?").bind(job.id).run();
-    }
-  }
-}
-
-// --- Telegram API helpers ---
 async function tgSendMessage(chatId, text) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -180,11 +177,7 @@ async function tgForwardMessage(toChatId, fromChatId, messageId) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chat_id: toChatId,
-      from_chat_id: fromChatId,
-      message_id: messageId,
-    }),
+    body: JSON.stringify({ chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId }),
   });
   const out = await res.text();
   if (!res.ok) console.log("forwardMessage failed:", out);
@@ -195,11 +188,7 @@ async function tgCopyMessage(toChatId, fromChatId, messageId) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chat_id: toChatId,
-      from_chat_id: fromChatId,
-      message_id: messageId,
-    }),
+    body: JSON.stringify({ chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId }),
   });
   const out = await res.text();
   if (!res.ok) console.log("copyMessage failed:", out);
@@ -210,10 +199,7 @@ async function tgDeleteMessage(chatId, messageId) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      message_id: Number(messageId),
-    }),
+    body: JSON.stringify({ chat_id: chatId, message_id: Number(messageId) }),
   });
   const out = await res.text();
   if (!res.ok) console.log("deleteMessage failed:", out);
