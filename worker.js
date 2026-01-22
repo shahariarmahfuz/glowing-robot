@@ -1,73 +1,81 @@
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Health check
-    if (url.pathname === "/" && request.method === "GET") {
-      return new Response("OK ✅ Telegram Forwarder Bot is running");
+    // Basic health
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response("OK ✅");
     }
 
-    // Webhook endpoint
-    if (url.pathname === "/webhook" && request.method === "POST") {
-      const update = await request.json();
+    // Verify route exists in browser
+    if (request.method === "GET" && url.pathname === "/webhook") {
+      return new Response("Webhook ready ✅ (Telegram uses POST)", { status: 200 });
+    }
 
-      const token = env.BOT_TOKEN;
-      const targetChatId = env.TARGET_CHAT_ID; // your private channel chat_id (e.g. -1001234567890)
+    // Telegram webhook (POST)
+    if (request.method === "POST" && url.pathname === "/webhook") {
+      try {
+        // IMPORTANT: never access env outside fetch
+        const token = env.BOT_TOKEN;
+        const targetChatId = env.TARGET_CHAT_ID;
 
-      if (!token) return new Response("Missing BOT_TOKEN", { status: 500 });
-      if (!targetChatId) return new Response("Missing TARGET_CHAT_ID", { status: 500 });
+        if (!token) {
+          console.log("ERROR: Missing BOT_TOKEN");
+          return new Response("ok", { status: 200 });
+        }
+        if (!targetChatId) {
+          console.log("ERROR: Missing TARGET_CHAT_ID");
+          return new Response("ok", { status: 200 });
+        }
 
-      const message =
-        update.message ||
-        update.edited_message ||
-        update.channel_post ||
-        update.edited_channel_post;
+        const update = await request.json();
+        const msg = update.message || update.edited_message;
 
-      // Nothing to forward
-      if (!message) return new Response("No message to forward", { status: 200 });
+        if (!msg) return new Response("ok", { status: 200 });
 
-      // Optional: ignore commands like /start
-      const text = message.text || "";
-      if (text.startsWith("/start")) {
-        await sendMessage(token, message.chat.id, "✅ Connected. যা পাঠাবে সব তোমার চ্যানেলে যাবে।");
+        const chatId = msg.chat.id;
+        const text = msg.text || "";
+
+        // Reply to start for testing
+        if (text === "/start") {
+          await tgSendMessage(token, chatId, "✅ Connected. এখন যাই পাঠাবে, সব তোমার চ্যানেলে যাবে।");
+          return new Response("ok", { status: 200 });
+        }
+
+        // Forward everything else
+        await tgForwardMessage(token, targetChatId, chatId, msg.message_id);
+
+        return new Response("ok", { status: 200 });
+      } catch (e) {
+        console.log("Webhook exception:", e?.stack || e?.message || String(e));
         return new Response("ok", { status: 200 });
       }
-
-      // Forward user’s message to your channel
-      await forwardMessage(token, targetChatId, message.chat.id, message.message_id);
-
-      // Optional: confirm user
-      // await sendMessage(token, message.chat.id, "✅ Sent to channel");
-
-      return new Response("ok", { status: 200 });
     }
 
     return new Response("Not found", { status: 404 });
   },
 };
 
-async function forwardMessage(token, toChatId, fromChatId, messageId) {
-  const res = await fetch(`https://api.telegram.org/bot${token}/forwardMessage`, {
+async function tgSendMessage(token, chatId, text) {
+  const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+  const t = await r.text();
+  if (!r.ok) console.log("sendMessage failed:", t);
+}
+
+async function tgForwardMessage(token, toChatId, fromChatId, messageId) {
+  const r = await fetch(`https://api.telegram.org/bot${token}/forwardMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       chat_id: toChatId,
       from_chat_id: fromChatId,
       message_id: messageId,
-      // disable_notification: true, // চাইলে অন করো
     }),
   });
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error("forwardMessage failed: " + errText);
-  }
-}
-
-async function sendMessage(token, chatId, text) {
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
-  });
+  const t = await r.text();
+  if (!r.ok) console.log("forwardMessage failed:", t);
 }
