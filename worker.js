@@ -2,21 +2,23 @@ import {
   BOT_TOKEN,
   TARGET_CHAT_ID,
   BOT_USERNAME,
-  DELETE_AFTER_SECONDS,
-  DELETE_NOTICE_TEXT,
+  EXPIRE_SECONDS,
+  TIMEZONE,
 } from "./config.js";
 
 /**
- * Main Worker
+ * MAIN WORKER
  */
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // health
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("OK ✅");
     }
 
+    // browser check
     if (request.method === "GET" && url.pathname === "/webhook") {
       return new Response("Webhook ready ✅ (Telegram uses POST)", { status: 200 });
     }
@@ -30,61 +32,94 @@ export default {
         const chatId = msg.chat.id;
         const text = msg.text || "";
 
-        // /start <token>
+        // ------------- /start <token> -------------
         if (text.startsWith("/start")) {
-          const payload = text.split(" ")[1];
+          const token = text.split(" ")[1];
 
-          if (!payload) {
-            await tgSendMessage(chatId, "✅ Ready! ফাইল পাঠাও, আমি লিংক বানিয়ে দেব।");
+          if (!token) {
+            await tgSendMessage(chatId, "✅ Ready!\nফাইল পাঠাও—আমি তোমাকে shareable link বানিয়ে দেব।");
             return new Response("ok", { status: 200 });
           }
 
-          const row = await env.DB
-            .prepare("SELECT channel_chat_id, channel_message_id FROM files WHERE token = ?")
-            .bind(payload)
-            .first();
+          const row = await env.DB.prepare(
+            "SELECT channel_chat_id, channel_message_id, uploaded_at, kind FROM files WHERE token = ?"
+          ).bind(token).first();
 
           if (!row) {
             await tgSendMessage(chatId, "❌ এই লিংকটি পাওয়া যায়নি / ভুল টোকেন।");
             return new Response("ok", { status: 200 });
           }
 
-          // copy from channel to user
+          // copy message from channel to user
           const copied = await tgCopyMessage(chatId, row.channel_chat_id, row.channel_message_id);
           const userMessageId = copied?.result?.message_id;
 
           if (!userMessageId) {
             console.log("copyMessage response:", JSON.stringify(copied));
-            await tgSendMessage(chatId, "⚠️ ফাইল পাঠাতে পারলাম না। পরে আবার চেষ্টা করো।");
+            await tgSendMessage(chatId, "⚠️ ফাইল পাঠানো যায়নি। পরে আবার চেষ্টা করো।");
             return new Response("ok", { status: 200 });
           }
 
-          // PERFECT delete scheduling via Durable Object alarm
-          await schedulePerfectDelete(env, String(chatId), Number(userMessageId), DELETE_AFTER_SECONDS);
+          // ✅ IMPORTANT: caption replace possible ONLY if message supports caption
+          const supportsCaption = captionSupportedKind(row.kind);
+
+          const uploadedText = formatDhaka(row.uploaded_at);
+          const link = deepLink(token);
+
+          // set initial caption (so later we can "replace" it)
+          if (supportsCaption) {
+            const initCaption = buildInitialCaption({
+              token,
+              uploadedText,
+              seconds: EXPIRE_SECONDS,
+              link,
+            });
+            await tgEditCaption(chatId, userMessageId, initCaption);
+          } else {
+            // fallback: send a small note (sticker etc can't have caption)
+            await tgSendMessage(chatId, `ℹ️ This message type can't show caption.\nLink: ${link}`);
+          }
+
+          // schedule PERFECT expire (edit caption after seconds)
+          await scheduleExpire(env, {
+            chatId: String(chatId),
+            messageId: Number(userMessageId),
+            token,
+            uploadedText,
+            seconds: EXPIRE_SECONDS,
+            mode: supportsCaption ? "edit_caption" : "send_notice",
+          });
 
           return new Response("ok", { status: 200 });
         }
 
-        // Any message => forward to channel => store token => send link
+        // ------------- upload: user sends file -------------
+        const kind = detectKind(msg);
+        if (!kind) {
+          await tgSendMessage(chatId, "⚠️ শুধু ফাইল/ফটো/ভিডিও/ডকুমেন্ট পাঠাও—তারপর আমি link বানাবো।");
+          return new Response("ok", { status: 200 });
+        }
+
+        // forward to channel (store)
         const fwd = await tgForwardMessage(TARGET_CHAT_ID, chatId, msg.message_id);
         const channelMessageId = fwd?.result?.message_id;
 
         if (!channelMessageId) {
           console.log("forwardMessage response:", JSON.stringify(fwd));
-          await tgSendMessage(chatId, "⚠️ ফরওয়ার্ড ঠিকমতো হয়নি। আবার চেষ্টা করো।");
+          await tgSendMessage(chatId, "⚠️ ফরওয়ার্ড হয়নি। আবার চেষ্টা করো।");
           return new Response("ok", { status: 200 });
         }
 
         const token = generateToken();
+        const uploadedAtIso = new Date().toISOString();
 
         await env.DB.prepare(
-          "INSERT INTO files (token, channel_chat_id, channel_message_id, from_user_id) VALUES (?, ?, ?, ?)"
+          "INSERT INTO files (token, channel_chat_id, channel_message_id, kind, uploaded_at) VALUES (?, ?, ?, ?, ?)"
         )
-          .bind(token, String(TARGET_CHAT_ID), Number(channelMessageId), Number(chatId))
+          .bind(token, String(TARGET_CHAT_ID), Number(channelMessageId), String(kind), uploadedAtIso)
           .run();
 
-        const link = `https://t.me/${BOT_USERNAME}?start=${token}`;
-        await tgSendMessage(chatId, `✅ Link created:\n${link}`);
+        await tgSendMessage(chatId, `✅ Link created:\n${deepLink(token)}`);
 
         return new Response("ok", { status: 200 });
       } catch (e) {
@@ -98,9 +133,9 @@ export default {
 };
 
 /**
- * Durable Object: schedules exact deletion via alarms
+ * DURABLE OBJECT (Perfect timing)
  */
-export class DeleteScheduler {
+export class ExpireCaptionScheduler {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -109,10 +144,9 @@ export class DeleteScheduler {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // Enqueue a delete job
     if (request.method === "POST" && url.pathname === "/enqueue") {
       const job = await request.json();
-      // job = { chatId, messageId, runAtMs }
+      // job: { chatId, messageId, runAtMs, token, uploadedText, seconds, mode }
       await this.state.storage.put("job", job);
       await this.state.storage.setAlarm(job.runAtMs);
       return new Response("ok");
@@ -126,35 +160,112 @@ export class DeleteScheduler {
     if (!job) return;
 
     try {
-      // delete message
-      await tgDeleteMessage(job.chatId, job.messageId);
+      const link = deepLink(job.token);
 
-      // send notice
-      await tgSendMessage(job.chatId, DELETE_NOTICE_TEXT);
+      if (job.mode === "edit_caption") {
+        const expiredCaption = buildExpiredCaption({
+          token: job.token,
+          uploadedText: job.uploadedText,
+          link,
+        });
+        await tgEditCaption(job.chatId, job.messageId, expiredCaption);
+      } else {
+        // fallback if caption not possible
+        await tgSendMessage(job.chatId, `⚠️ Expired.\nUploaded: ${job.uploadedText}\nLink: ${link}`);
+      }
     } catch (e) {
       console.log("Alarm error:", e?.stack || e?.message || String(e));
     } finally {
-      // clear job to avoid repeats
       await this.state.storage.delete("job");
     }
   }
 }
 
 /**
- * Schedule exact delete
+ * Schedule DO alarm
  */
-async function schedulePerfectDelete(env, chatId, messageId, seconds) {
-  // Unique DO instance per chatId+messageId, so jobs don't overwrite each other
-  const id = env.DEL.idFromName(`${chatId}:${messageId}`);
+async function scheduleExpire(env, job) {
+  const id = env.DEL.idFromName(`${job.chatId}:${job.messageId}`);
   const stub = env.DEL.get(id);
 
-  const runAtMs = Date.now() + seconds * 1000;
+  const runAtMs = Date.now() + job.seconds * 1000;
 
   await stub.fetch("https://do/enqueue", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chatId, messageId, runAtMs }),
+    body: JSON.stringify({ ...job, runAtMs }),
   });
+}
+
+/**
+ * Captions
+ */
+function buildInitialCaption({ token, uploadedText, seconds, link }) {
+  const short = token.slice(0, 10);
+  return [
+    `📦 Uploaded: ${uploadedText}`,
+    `🆔 File: ${short}`,
+    `⏳ Auto-expire in ${seconds}s`,
+    `🔗 ${link}`,
+  ].join("\n");
+}
+
+function buildExpiredCaption({ token, uploadedText, link }) {
+  const short = token.slice(0, 10);
+  return [
+    "⚠️ টেলিগ্রামের কপিরাইট/নিরাপত্তা নীতির কারণে এই ফাইলটি আর উপলব্ধ নয়।",
+    "",
+    `📦 Uploaded: ${uploadedText}`,
+    `🆔 File: ${short}`,
+    "🔁 পুনরায় ফাইল পেতে নিচের লিংক ব্যবহার করুন:",
+    `🔗 ${link}`,
+  ].join("\n");
+}
+
+function deepLink(token) {
+  return `https://t.me/${BOT_USERNAME}?start=${token}`;
+}
+
+/**
+ * Detect kind from user message
+ */
+function detectKind(msg) {
+  if (msg.document) return "document";
+  if (msg.photo) return "photo";
+  if (msg.video) return "video";
+  if (msg.animation) return "animation";
+  if (msg.audio) return "audio";
+  if (msg.voice) return "voice";
+  // sticker has no caption support; optional:
+  if (msg.sticker) return "sticker";
+  return null;
+}
+
+function captionSupportedKind(kind) {
+  // sticker doesn't support caption
+  return kind !== "sticker";
+}
+
+/**
+ * Time formatting (Bangladesh)
+ */
+function formatDhaka(iso) {
+  try {
+    const dt = new Date(iso);
+    const fmt = new Intl.DateTimeFormat("en-GB", {
+      timeZone: TIMEZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    return fmt.format(dt);
+  } catch {
+    return iso;
+  }
 }
 
 /**
@@ -209,6 +320,7 @@ async function tgCopyMessage(toChatId, fromChatId, messageId) {
       chat_id: toChatId,
       from_chat_id: fromChatId,
       message_id: messageId,
+      // protect_content: true, // চাইলে অন করো
     }),
   });
   const out = await res.text();
@@ -216,13 +328,17 @@ async function tgCopyMessage(toChatId, fromChatId, messageId) {
   try { return JSON.parse(out); } catch { return { raw: out }; }
 }
 
-async function tgDeleteMessage(chatId, messageId) {
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+async function tgEditCaption(chatId, messageId, caption) {
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageCaption`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, message_id: Number(messageId) }),
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: Number(messageId),
+      caption,
+    }),
   });
   const out = await res.text();
-  if (!res.ok) console.log("deleteMessage failed:", out);
+  if (!res.ok) console.log("editMessageCaption failed:", out);
   try { return JSON.parse(out); } catch { return { raw: out }; }
 }
