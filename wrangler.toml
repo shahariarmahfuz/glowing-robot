@@ -13,4 +13,4 @@ class_name = "DeleteScheduler"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["DeleteScheduler"]
+new_sqlite_classes = ["DeleteScheduler"]
