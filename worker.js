@@ -6,8 +6,11 @@ import {
   DELETE_NOTICE_TEXT,
 } from "./config.js";
 
+/**
+ * Main Worker
+ */
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
@@ -15,7 +18,7 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/webhook") {
-      return new Response("Webhook ready ✅", { status: 200 });
+      return new Response("Webhook ready ✅ (Telegram uses POST)", { status: 200 });
     }
 
     if (request.method === "POST" && url.pathname === "/webhook") {
@@ -46,27 +49,23 @@ export default {
             return new Response("ok", { status: 200 });
           }
 
-          await env.DB.prepare("UPDATE files SET hits = hits + 1 WHERE token = ?")
-            .bind(payload)
-            .run();
-
-          // Copy file from channel to user
+          // copy from channel to user
           const copied = await tgCopyMessage(chatId, row.channel_chat_id, row.channel_message_id);
           const userMessageId = copied?.result?.message_id;
 
           if (!userMessageId) {
             console.log("copyMessage response:", JSON.stringify(copied));
-            await tgSendMessage(chatId, "⚠️ ফাইল পাঠানো যায়নি। পরে আবার চেষ্টা করো।");
+            await tgSendMessage(chatId, "⚠️ ফাইল পাঠাতে পারলাম না। পরে আবার চেষ্টা করো।");
             return new Response("ok", { status: 200 });
           }
 
-          // ✅ Perfect-timing delete via Durable Object alarm
-          await scheduleDelete(env, String(chatId), Number(userMessageId), DELETE_AFTER_SECONDS);
+          // PERFECT delete scheduling via Durable Object alarm
+          await schedulePerfectDelete(env, String(chatId), Number(userMessageId), DELETE_AFTER_SECONDS);
 
           return new Response("ok", { status: 200 });
         }
 
-        // Any other message => forward to channel => save token => send link
+        // Any message => forward to channel => store token => send link
         const fwd = await tgForwardMessage(TARGET_CHAT_ID, chatId, msg.message_id);
         const channelMessageId = fwd?.result?.message_id;
 
@@ -98,8 +97,10 @@ export default {
   },
 };
 
-// ---------------- Durable Object (Perfect Timer) ----------------
-export class DeleteTimer {
+/**
+ * Durable Object: schedules exact deletion via alarms
+ */
+export class DeleteScheduler {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -107,54 +108,63 @@ export class DeleteTimer {
 
   async fetch(request) {
     const url = new URL(request.url);
-    if (url.pathname !== "/schedule") return new Response("Not found", { status: 404 });
 
-    const { chatId, messageId, delaySeconds } = await request.json();
+    // Enqueue a delete job
+    if (request.method === "POST" && url.pathname === "/enqueue") {
+      const job = await request.json();
+      // job = { chatId, messageId, runAtMs }
+      await this.state.storage.put("job", job);
+      await this.state.storage.setAlarm(job.runAtMs);
+      return new Response("ok");
+    }
 
-    // store job data
-    await this.state.storage.put("job", { chatId, messageId });
-
-    // set alarm precisely
-    const when = Date.now() + Math.max(1, delaySeconds) * 1000;
-    await this.state.storage.setAlarm(when);
-
-    return new Response("scheduled", { status: 200 });
+    return new Response("not found", { status: 404 });
   }
 
   async alarm() {
     const job = await this.state.storage.get("job");
     if (!job) return;
 
-    // delete message
-    await tgDeleteMessage(job.chatId, job.messageId);
+    try {
+      // delete message
+      await tgDeleteMessage(job.chatId, job.messageId);
 
-    // send notice
-    await tgSendMessage(job.chatId, DELETE_NOTICE_TEXT);
-
-    // cleanup
-    await this.state.storage.deleteAll();
+      // send notice
+      await tgSendMessage(job.chatId, DELETE_NOTICE_TEXT);
+    } catch (e) {
+      console.log("Alarm error:", e?.stack || e?.message || String(e));
+    } finally {
+      // clear job to avoid repeats
+      await this.state.storage.delete("job");
+    }
   }
 }
 
-async function scheduleDelete(env, chatId, messageId, delaySeconds) {
-  // unique object per (chatId,messageId)
+/**
+ * Schedule exact delete
+ */
+async function schedulePerfectDelete(env, chatId, messageId, seconds) {
+  // Unique DO instance per chatId+messageId, so jobs don't overwrite each other
   const id = env.DEL.idFromName(`${chatId}:${messageId}`);
   const stub = env.DEL.get(id);
 
-  await stub.fetch("https://do/schedule", {
+  const runAtMs = Date.now() + seconds * 1000;
+
+  await stub.fetch("https://do/enqueue", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chatId, messageId, delaySeconds }),
+    body: JSON.stringify({ chatId, messageId, runAtMs }),
   });
 }
 
-// ---------------- Helpers ----------------
+/**
+ * Token helpers
+ */
 function generateToken() {
   const bytes = new Uint8Array(12);
   crypto.getRandomValues(bytes);
   return base64Url(bytes);
 }
-
 function base64Url(bytes) {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
@@ -162,6 +172,9 @@ function base64Url(bytes) {
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+/**
+ * Telegram helpers
+ */
 async function tgSendMessage(chatId, text) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -177,7 +190,11 @@ async function tgForwardMessage(toChatId, fromChatId, messageId) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId }),
+    body: JSON.stringify({
+      chat_id: toChatId,
+      from_chat_id: fromChatId,
+      message_id: messageId,
+    }),
   });
   const out = await res.text();
   if (!res.ok) console.log("forwardMessage failed:", out);
@@ -188,7 +205,11 @@ async function tgCopyMessage(toChatId, fromChatId, messageId) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId }),
+    body: JSON.stringify({
+      chat_id: toChatId,
+      from_chat_id: fromChatId,
+      message_id: messageId,
+    }),
   });
   const out = await res.text();
   if (!res.ok) console.log("copyMessage failed:", out);
