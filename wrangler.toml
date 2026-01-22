@@ -9,8 +9,8 @@ database_id = "5e0b4dd0-6034-4896-989a-3c50a9132e96"
 
 [[durable_objects.bindings]]
 name = "DEL"
-class_name = "DeleteScheduler"
+class_name = "ExpireCaptionScheduler"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["DeleteScheduler"]
+new_sqlite_classes = ["ExpireCaptionScheduler"]
