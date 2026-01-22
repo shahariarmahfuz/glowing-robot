@@ -1,3 +1,8 @@
 name = "glowing-robot"
 main = "worker.js"
 compatibility_date = "2026-01-22"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "glowing_robot_db"
+database_id = "5e0b4dd0-6034-4896-989a-3c50a9132e96"
