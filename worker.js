@@ -13,16 +13,17 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // health
+    // Health check
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("OK ✅");
     }
 
-    // browser check
+    // Browser verify route exists
     if (request.method === "GET" && url.pathname === "/webhook") {
       return new Response("Webhook ready ✅ (Telegram uses POST)", { status: 200 });
     }
 
+    // Telegram webhook
     if (request.method === "POST" && url.pathname === "/webhook") {
       try {
         const update = await request.json();
@@ -32,15 +33,17 @@ export default {
         const chatId = msg.chat.id;
         const text = msg.text || "";
 
-        // ------------- /start <token> -------------
+        // ---------------- /start <token> ----------------
         if (text.startsWith("/start")) {
           const token = text.split(" ")[1];
 
+          // normal /start
           if (!token) {
-            await tgSendMessage(chatId, "✅ Ready!\nফাইল পাঠাও—আমি তোমাকে shareable link বানিয়ে দেব।");
+            await tgSendMessage(chatId, "✅ Ready!\nফাইল পাঠাও—আমি shareable link বানিয়ে দেব।");
             return new Response("ok", { status: 200 });
           }
 
+          // token -> channel msg lookup
           const row = await env.DB.prepare(
             "SELECT channel_chat_id, channel_message_id, uploaded_at, kind FROM files WHERE token = ?"
           ).bind(token).first();
@@ -50,7 +53,7 @@ export default {
             return new Response("ok", { status: 200 });
           }
 
-          // copy message from channel to user
+          // Copy from channel to user
           const copied = await tgCopyMessage(chatId, row.channel_chat_id, row.channel_message_id);
           const userMessageId = copied?.result?.message_id;
 
@@ -60,13 +63,11 @@ export default {
             return new Response("ok", { status: 200 });
           }
 
-          // ✅ IMPORTANT: caption replace possible ONLY if message supports caption
-          const supportsCaption = captionSupportedKind(row.kind);
-
-          const uploadedText = formatDhaka(row.uploaded_at);
+          const uploadedText = formatInTZ(row.uploaded_at);
           const link = deepLink(token);
 
-          // set initial caption (so later we can "replace" it)
+          // Set initial caption (so later we can "replace" it)
+          const supportsCaption = captionSupportedKind(row.kind);
           if (supportsCaption) {
             const initCaption = buildInitialCaption({
               token,
@@ -76,11 +77,11 @@ export default {
             });
             await tgEditCaption(chatId, userMessageId, initCaption);
           } else {
-            // fallback: send a small note (sticker etc can't have caption)
+            // fallback: message types like sticker can't have caption
             await tgSendMessage(chatId, `ℹ️ This message type can't show caption.\nLink: ${link}`);
           }
 
-          // schedule PERFECT expire (edit caption after seconds)
+          // Perfect timing expire (caption replace) via Durable Object alarm
           await scheduleExpire(env, {
             chatId: String(chatId),
             messageId: Number(userMessageId),
@@ -93,14 +94,14 @@ export default {
           return new Response("ok", { status: 200 });
         }
 
-        // ------------- upload: user sends file -------------
+        // --------------- Upload: user sends a file/media ---------------
         const kind = detectKind(msg);
         if (!kind) {
           await tgSendMessage(chatId, "⚠️ শুধু ফাইল/ফটো/ভিডিও/ডকুমেন্ট পাঠাও—তারপর আমি link বানাবো।");
           return new Response("ok", { status: 200 });
         }
 
-        // forward to channel (store)
+        // Forward to channel for storage
         const fwd = await tgForwardMessage(TARGET_CHAT_ID, chatId, msg.message_id);
         const channelMessageId = fwd?.result?.message_id;
 
@@ -124,6 +125,7 @@ export default {
         return new Response("ok", { status: 200 });
       } catch (e) {
         console.log("Webhook error:", e?.stack || e?.message || String(e));
+        // always 200 so Telegram doesn't spam retries
         return new Response("ok", { status: 200 });
       }
     }
@@ -133,9 +135,10 @@ export default {
 };
 
 /**
- * DURABLE OBJECT (Perfect timing)
+ * DURABLE OBJECT: schedules exact expire and replaces caption (no delete)
+ * NOTE: Class name MUST stay "DeleteScheduler" (your existing DO class).
  */
-export class ExpireCaptionScheduler {
+export class DeleteScheduler {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -170,8 +173,11 @@ export class ExpireCaptionScheduler {
         });
         await tgEditCaption(job.chatId, job.messageId, expiredCaption);
       } else {
-        // fallback if caption not possible
-        await tgSendMessage(job.chatId, `⚠️ Expired.\nUploaded: ${job.uploadedText}\nLink: ${link}`);
+        // fallback if caption isn't supported
+        await tgSendMessage(
+          job.chatId,
+          `⚠️ Expired.\nUploaded: ${job.uploadedText}\nLink: ${link}`
+        );
       }
     } catch (e) {
       console.log("Alarm error:", e?.stack || e?.message || String(e));
@@ -182,7 +188,7 @@ export class ExpireCaptionScheduler {
 }
 
 /**
- * Schedule DO alarm
+ * Schedule DO alarm (perfect timing)
  */
 async function scheduleExpire(env, job) {
   const id = env.DEL.idFromName(`${job.chatId}:${job.messageId}`);
@@ -236,20 +242,18 @@ function detectKind(msg) {
   if (msg.animation) return "animation";
   if (msg.audio) return "audio";
   if (msg.voice) return "voice";
-  // sticker has no caption support; optional:
-  if (msg.sticker) return "sticker";
+  if (msg.sticker) return "sticker"; // no caption
   return null;
 }
 
 function captionSupportedKind(kind) {
-  // sticker doesn't support caption
   return kind !== "sticker";
 }
 
 /**
- * Time formatting (Bangladesh)
+ * Time formatting in Bangladesh timezone
  */
-function formatDhaka(iso) {
+function formatInTZ(iso) {
   try {
     const dt = new Date(iso);
     const fmt = new Intl.DateTimeFormat("en-GB", {
@@ -276,6 +280,7 @@ function generateToken() {
   crypto.getRandomValues(bytes);
   return base64Url(bytes);
 }
+
 function base64Url(bytes) {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
@@ -320,7 +325,6 @@ async function tgCopyMessage(toChatId, fromChatId, messageId) {
       chat_id: toChatId,
       from_chat_id: fromChatId,
       message_id: messageId,
-      // protect_content: true, // চাইলে অন করো
     }),
   });
   const out = await res.text();
@@ -341,4 +345,4 @@ async function tgEditCaption(chatId, messageId, caption) {
   const out = await res.text();
   if (!res.ok) console.log("editMessageCaption failed:", out);
   try { return JSON.parse(out); } catch { return { raw: out }; }
-}
+    }
